@@ -37,6 +37,9 @@ struct cc2530_cmd {
 static unsigned debug_enabled;
 static unsigned verbose, progress;
 
+#define CLOCK_PULSE_NS		5
+#define DIR_CHANGE_NS		73
+
 #define DEFAULT_TIMEOUT		1000
 
 #define CMD_ERASE		0x10
@@ -67,6 +70,7 @@ static unsigned verbose, progress;
 
 /* IDs that we recognize */
 #define CC2530_ID		0xA5
+#define CC2541_ID		0x41
 
 /* Buffers */
 #define ADDR_BUF0		0x0000 /* 1K */
@@ -269,6 +273,10 @@ static int cc2530_gpio_init(void)
 	int ret;
 	unsigned int i;
 
+    if (gpio_init() != 0) {
+        fprintf(stderr, "failed to initialize gpio\n");
+        return -1;
+    }
 	for (i = 0; i < ARRAY_SIZE(gpios); i++) {
 		ret = gpio_export(gpios[i]);
 		if (ret) {
@@ -311,56 +319,105 @@ static int cc2530_gpio_deinit(void)
 	return 0;
 }
 
-/*
- * Hold reset low while raising clock twice
- */
-static int cc2530_enter_debug(void)
+
+static void delay_ns(unsigned int ns)
 {
-	int i;
-
-	/* pulse RST low */
-	gpio_set_value(RST_GPIO, RST_GPIO_POL 0);
-
-	for (i = 0; i < 2; i++) {
-		gpio_set_value(CCLK_GPIO, 0);
-		gpio_set_value(CCLK_GPIO, 1);
-	}
-
-	/* Keep clock low */
-	gpio_set_value(CCLK_GPIO, 0);
-
-	/* pulse Reset high */
-	gpio_set_value(RST_GPIO, RST_GPIO_POL 1);
-
-	debug_enabled = 1;
-
-	return 0;
+    struct timespec sleeper, dummy;
+    sleeper.tv_sec  = 0;
+    sleeper.tv_nsec = ns;
+    nanosleep (&sleeper, &dummy) ;
 }
+
+void delay (unsigned int millis)
+{
+  struct timespec sleeper, dummy ;
+
+  sleeper.tv_sec  = (time_t)(millis / 1000) ;
+  sleeper.tv_nsec = (long)(millis % 1000) * 1000000 ;
+  nanosleep (&sleeper, &dummy) ;
+}
+
 
 static int cc2530_leave_debug(void)
 {
-	gpio_set_value(RST_GPIO, RST_GPIO_POL 0);
-	gpio_set_value(RST_GPIO, RST_GPIO_POL 1);
-
-	return 0;
+    gpio_set_value(RST_GPIO, 0);
+    delay(100);
+    gpio_set_value(RST_GPIO, 1);
+    return 0;
 }
+
+
+/*
+ * Hold reset low while raising clock twice
+ */
+
+
+static int cc2530_enter_debug(void)
+{
+	// Cleanup
+    cc2530_leave_debug();
+
+	/*  Debug mode is entered by forcing two falling-edge transitions
+		on pin P2.2 (debug clock) while the RESET_N input is held low.
+		When RESET_N is set high, the device is in debug mode. */
+
+	// Start from CLOCK high
+    gpio_set_value(CCLK_GPIO, 1);
+    gpio_set_value(DATA_GPIO, 0);
+    delay(10);
+
+
+	// Put RESET to low
+    gpio_set_value(RST_GPIO, 0);
+    delay(10);
+
+	// First CLOCK falling edge
+    gpio_set_value(CCLK_GPIO, 0);
+    delay(10);
+    gpio_set_value(CCLK_GPIO, 1);
+    delay(10);
+
+	// Second CLOCK falling edge
+    gpio_set_value(CCLK_GPIO, 0);
+    delay(10);
+
+	// Return Reset to high
+    gpio_set_value(RST_GPIO, 1);
+    delay(10);
+
+    debug_enabled = 1;
+
+    return 0;
+}
+
 
 /*
  * Bit-bang a byte on the GPIO data line
  */
 static inline void send_byte(unsigned char byte)
 {
-	int i;
+    int i;
 
-	/* Data setup on rising clock edge */
-	for (i = 7; i >= 0; i--) {
-		if (byte & (1 << i))
-			gpio_set_value(DATA_GPIO, 1);
-		else
-			gpio_set_value(DATA_GPIO, 0);
-		gpio_set_value(CCLK_GPIO, 1);
-		gpio_set_value(CCLK_GPIO, 0);
-	}
+    /* Data is driven on the positive edge of the debug clock and sampled on the negative edge.*/
+    for (i = 7; i >= 0; i--) {
+		// Positive edge
+        gpio_set_value(CCLK_GPIO, 1);
+
+        // Set data
+        if (byte & (1 << i))
+            gpio_set_value(DATA_GPIO, 1);
+        else
+            gpio_set_value(DATA_GPIO, 0);
+
+		// Let the receiver to see the edge
+        delay_ns(CLOCK_PULSE_NS);
+
+		// Negative edge
+        gpio_set_value(CCLK_GPIO, 0);
+
+		// Let the receiver to sample the data
+        delay_ns(CLOCK_PULSE_NS);
+    }
 }
 
 /*
@@ -368,19 +425,33 @@ static inline void send_byte(unsigned char byte)
  */
 static inline void read_byte(unsigned char *byte)
 {
-	int i;
-	bool val;
-	*byte = 0;
+    int i;
+    bool val;
+    *byte = 0;
 
-	/* data read on falling clock edge */
-	for (i = 7; i >= 0; i--) {
-		gpio_set_value(CCLK_GPIO, 1);
-		gpio_get_value(DATA_GPIO, &val);
-		if (val)
-			*byte |= (1 << i);
-		gpio_set_value(CCLK_GPIO, 0);
-	}
+    /* Data is driven on the positive edge of the debug clock and sampled on the negative edge.*/
+    for (i = 7; i >= 0; i--) {
+		// Positive edge
+        gpio_set_value(CCLK_GPIO, 1);
+
+		// Let the receiver to set the data
+        delay_ns(CLOCK_PULSE_NS);
+
+		// Negative edge
+        gpio_set_value(CCLK_GPIO, 0);
+
+		// Sample data bit
+        gpio_get_value(DATA_GPIO, &val);
+
+		// Wait before next pulse
+        delay_ns(CLOCK_PULSE_NS);
+
+		// Accumulate bit
+        if (val)
+            *byte |= (1 << i);
+    }
 }
+
 
 /*
  * Send the command to the chip
@@ -389,7 +460,6 @@ static int cc2530_do_cmd(const struct cc2530_cmd *cmd, unsigned char *params, un
 {
 	int ret;
 	int bytes;
-	unsigned int timeout = DEFAULT_TIMEOUT;
 	bool val;
 	unsigned char *answer;
 
@@ -433,24 +503,7 @@ static int cc2530_do_cmd(const struct cc2530_cmd *cmd, unsigned char *params, un
 		goto out_exit;
 	}
 
-	/*
-	 * Cope with commands requiring a response delay and those which do
-	 * not. In case the data line was not low right after we wrote data to
-	 * clock out the chip 8 times as per the specification mentions. The
-	 * data line should then be low and we are ready to read out from the
-	 * chip.
-	 */
-	gpio_get_value(DATA_GPIO, &val);
-	while (val && timeout--) {
-		for (bytes = 0; bytes < 8; bytes++) {
-			gpio_set_value(CCLK_GPIO, 1);
-			gpio_set_value(CCLK_GPIO, 0);
-		}
-		gpio_get_value(DATA_GPIO, &val);
-	}
-
-	if (!timeout) {
-		fprintf(stderr, "timed out waiting for chip to be ready again\n");
+    if (wait_chip_ready() != 0) {
 		goto out_exit;
 	}
 
@@ -464,6 +517,39 @@ out_exit:
 	return ret;
 }
 
+int wait_chip_ready(void)
+{
+	unsigned int timeout = DEFAULT_TIMEOUT;
+	unsigned char dummy;
+    bool val = 1;
+	/*
+	 * Cope with commands requiring a response delay and those which do
+	 * not. In case the data line was not low right after we wrote data to
+	 * clock out the chip 8 times as per the specification mentions. The
+	 * data line should then be low and we are ready to read out from the
+	 * chip.
+	 */
+	while (timeout--) {
+		// Wait for pad direction change
+		delay_ns(DIR_CHANGE_NS);
+		// Check if chip is ready to send result
+		gpio_get_value(DATA_GPIO, &val);
+		if (val == 0) break;
+		// When result is not ready, do dummy byte read
+		read_byte(&dummy);
+		if ((dummy|1) != 0xFF) printf("Suddenly chip returned something despite it was not ready: %02x\n", dummy);
+        // Avoid extra wait when chip sets data low on last clock front
+        if ((dummy & 1) == 0) break;
+	}
+
+	if (!timeout) {
+		fprintf(stderr, "timed out waiting for chip to be ready again\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 /*
  * Bypass the command sending infrastructure to allow
  * direct access to the what is sent to the chip
@@ -473,7 +559,6 @@ static int cc2530_burst_write(void)
 	int ret;
 	uint16_t i;
 	unsigned char result;
-	unsigned int timeout = DEFAULT_TIMEOUT;
 	bool val;
 
 	ret = gpio_set_direction(DATA_GPIO, GPIO_DIRECTION_OUT);
@@ -494,17 +579,7 @@ static int cc2530_burst_write(void)
 		return ret;
 	}
 
-	gpio_get_value(DATA_GPIO, &val);
-	while (val && timeout--) {
-		for (i = 0; i < 8; i++) {
-			gpio_set_value(CCLK_GPIO, 1);
-			gpio_set_value(CCLK_GPIO, 0);
-		}
-		gpio_get_value(DATA_GPIO, &val);
-	}
-
-	if (!timeout) {
-		fprintf(stderr, "timed out waiting for chip to be ready\n");
+	if (wait_chip_ready() != 0) {
 		return -1;
 	}
 
@@ -865,7 +940,7 @@ static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 	}
 
 	/* Check that we actually know that chip */
-	if (result[0] != CC2530_ID) {
+	if ((result[0] != CC2530_ID) && (result[0] != CC2541_ID)) {
 		fprintf(stderr, "unknown Chip ID: %02x\n", result[0]);
 		if (result[0] == 0xFF || result[0] == 0)
 			fprintf(stderr, "someone is holding the CLK/DATA lines against us "
@@ -875,7 +950,19 @@ static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 	}
 
 	if (verbose)
-		printf("Texas Instruments CC2530 (ID: 0x%02x, rev 0x%02x)\n", result[0], result[1]);
+        printf("Texas Instruments CC2530 (ID: 0x%02x, rev 0x%02x)\n", result[0], result[1]);
+
+    // We need to halt the chip before sending debug instructions
+	cmd = find_cmd_by_name("halt");
+	ret = cc2530_do_cmd(cmd, NULL, result);
+	if (ret) { fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name); goto out; }
+    printf("status halt returns: %02x\n", result[0]);
+
+	cmd = find_cmd_by_name("read_status");
+	ret = cc2530_do_cmd(cmd, NULL, result);
+	if (ret) { fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name); goto out; }
+    printf("status after halt: %02x\n", result[0]);
+
 	/*
 	 * Do some chip identification
 	 */
@@ -900,6 +987,7 @@ static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 	}
 
 	if (verbose) {
+		printf("Chip Info 0: %02x\n", result[0]);
 		if (result[0] & 8)
 			printf("USB available\n");
 		else

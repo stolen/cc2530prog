@@ -67,6 +67,13 @@ int write_file(const char *path, const char *str)
 
 
 int
+gpio_init(void)
+{
+    return 0;
+}
+
+
+int
 gpio_export(int n)
 {
 	char buf[16];

@@ -5,7 +5,11 @@
 CC?=gcc
 CFLAGS?=
 APP=cc2530prog
-GPIO_BACKEND?=gpio-sysfs
+GPIO_BACKEND?=gpio-wiringPi
+
+ifeq ($(GPIO_BACKEND),gpio-wiringPi)
+    CFLAGS+= -I/usr/local/include -L/usr/local/lib -lwiringPi
+endif
 
 all: $(APP)
 

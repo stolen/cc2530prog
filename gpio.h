@@ -11,7 +11,7 @@
 #define RST_GPIO        0
 #define  RST_GPIO_POL   !       /* Active low polarity */
 #define CCLK_GPIO       1
-#define DATA_GPIO       2
+#define DATA_GPIO       4
 
 /*
  * gpio sysfs helpers
@@ -22,6 +22,7 @@ enum gpio_direction {
 	GPIO_DIRECTION_HIGH,
 };
 
+int gpio_init(void);
 int gpio_export(int n);
 int gpio_unexport(int n);
 int gpio_set_direction(int n, enum gpio_direction direction);
