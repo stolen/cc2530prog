@@ -84,6 +84,7 @@ static unsigned verbose, progress;
 #define CH_BUF1_TO_FLASH 	0x10
 
 #define PROG_BLOCK_SIZE		1024
+#define LOCK_DATA_SIZE      16
 
 #define LOBYTE(w) ((uint8_t)(w))
 #define HIBYTE(w) ((uint8_t)(((uint16_t)(w) >> 8) & 0xFF))
@@ -96,13 +97,16 @@ static unsigned verbose, progress;
 #define X_EXT_ADDR_BASE	0x616A
 #define DBGDATA		0x6260
 #define FCTL		0x6270
+#define FLASH_BANK_SIZE 0x8000
+#define FLASH_WORD_SIZE 4
 #define FADDRL		0x6271
 #define FADDRH		0x6272
 #define FWDATA		0x6273
 #define X_CHIPINFO0	0x6276
 #define X_CHIPINFO1	0x6277
 
-#define X_MEMCTR	0x70C7
+#define MEMCTR	    0xC7
+#define X_MEMCTR	(0x70 | MEMCTR)
 #define X_DMA1CFGH	0x70D3
 #define X_DMA1CFGL	0x70D4
 #define X_DMAARM	0x70D6
@@ -550,6 +554,9 @@ int wait_chip_ready(void)
     return 0;
 }
 
+static int set_dptr(struct cc2530_cmd *cmd, uint16_t addr);
+static int set_acc(struct cc2530_cmd *cmd, uint8_t value);
+
 /*
  * Bypass the command sending infrastructure to allow
  * direct access to the what is sent to the chip
@@ -570,8 +577,9 @@ static int cc2530_burst_write(void)
 	send_byte(CMD_BURST_WR | HIBYTE(PROG_BLOCK_SIZE));
 	send_byte(LOBYTE(PROG_BLOCK_SIZE));
 
-	for (i = 0; i < PROG_BLOCK_SIZE; i++)
+	for (i = 0; i < PROG_BLOCK_SIZE; i++) {
 		send_byte(get_next_flash_byte());
+    }
 
 	ret = gpio_set_direction(DATA_GPIO, GPIO_DIRECTION_IN);
 	if (ret) {
@@ -619,126 +627,201 @@ static int cc2530_chip_erase(struct cc2530_cmd *cmd)
 	return 0;
 }
 
-static int cc2530_write_xdata_memory(struct cc2530_cmd *cmd, uint16_t addr, uint8_t value)
-{
-	int ret;
+
+static int write_sfr(struct cc2530_cmd *cmd, uint8_t sfr, uint8_t value) {
 	unsigned char instr[3];
 	unsigned char result;
+	int ret;
+    instr[0] = 0x75;
+    instr[1] = sfr;
+    instr[2] = value;
+    cmd->in = sizeof(instr);
 
-	cmd = find_cmd_by_name("debug_inst");
-	instr[0] = 0x90;
-	instr[1] = HIBYTE(addr);
-	instr[2] = LOBYTE(addr);
-	cmd->in = sizeof(instr);
-
-	ret = cc2530_do_cmd(cmd, instr, &result);
-	if (ret) {
-		fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name);
-		return ret;
-	}
-
-	instr[0] = 0x74;
-	instr[1] = value;
-	cmd->in = 2;
-
-	ret = cc2530_do_cmd(cmd, instr, &result);
-	if (ret) {
-		fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name);
-		return ret;
-	}
-
-	instr[0] = 0xF0;
-	cmd->in = 1;
-	ret = cc2530_do_cmd(cmd, instr, &result);
-	if (ret) {
-		fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name);
-		return ret;
-	}
-
-	return 0;
+    ret = cc2530_do_cmd(cmd, instr, &result);
+    if (ret) {
+        fprintf(stderr, "%s: write sfr command failed\n", __func__);
+    }
+    return ret;
 }
+
+static int set_dptr(struct cc2530_cmd *cmd, uint16_t addr) {
+	unsigned char instr[3];
+	unsigned char result;
+	int ret;
+    instr[0] = 0x90;
+    instr[1] = HIBYTE(addr);
+    instr[2] = LOBYTE(addr);
+    cmd->in = sizeof(instr);
+
+    ret = cc2530_do_cmd(cmd, instr, &result);
+    if (ret) {
+        fprintf(stderr, "%s: set dptr command failed\n", __func__);
+    }
+    return ret;
+}
+
+static int copy_acc_to_dptr(struct cc2530_cmd *cmd) {
+	unsigned char instr[1];
+	unsigned char result;
+	int ret;
+    instr[0] = 0xF0;
+    cmd->in = 1;
+
+    ret = cc2530_do_cmd(cmd, instr, &result);
+    if (ret) {
+        fprintf(stderr, "failed to issue MOVX A, @DPTR\n");
+    }
+    return ret;
+}
+
+static int read_at_dptr(struct cc2530_cmd *cmd, uint8_t* result) {
+	unsigned char instr[1];
+	int ret;
+    instr[0] = 0xE0;
+    cmd->in = 1;
+
+    ret = cc2530_do_cmd(cmd, instr, result);
+    if (ret) {
+        fprintf(stderr, "failed to issue MOVX A, @DPTR\n");
+    }
+    return ret;
+}
+
+static int inc_dptr(struct cc2530_cmd *cmd) {
+	unsigned char instr[1];
+	unsigned char result;
+	int ret;
+    instr[0] = 0xA3;
+    cmd->in = 1;
+
+    ret = cc2530_do_cmd(cmd, instr, &result);
+    if (ret) {
+        fprintf(stderr, "failed to INC DPTR\n");
+    }
+    return ret;
+}
+
+static int set_acc(struct cc2530_cmd *cmd, uint8_t value) {
+	unsigned char instr[2];
+	unsigned char result;
+	int ret;
+
+    instr[0] = 0x74;
+    instr[1] = value;
+    cmd->in = 2;
+
+    ret = cc2530_do_cmd(cmd, instr, &result);
+    if (ret) {
+        fprintf(stderr, "failed to set acc value\n");
+    }
+    return ret;
+}
+
+
+
 
 static int cc2530_read_xdata_memory(struct cc2530_cmd *cmd, uint16_t addr, unsigned char *result)
 {
 	int ret;
-	unsigned char instr[3];
-	unsigned char res;
+	uint16_t i;
 
 	cmd = find_cmd_by_name("debug_inst");
-	instr[0] = 0x90;
-	instr[1] = HIBYTE(addr);
-	instr[2] = LOBYTE(addr);
-	cmd->in = sizeof(instr);
 
-	ret = cc2530_do_cmd(cmd, instr, result);
-	if (ret) {
-		fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name);
-		return ret;
-	}
+	ret = set_dptr(cmd, addr);
+	if (ret) { return ret; }
 
-	instr[0] = 0xE0;
-	cmd->in = 1;
-
-	ret = cc2530_do_cmd(cmd, instr, &res);
-	if (ret) {
-		fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name);
-		return ret;
-	}
-	memcpy(result, &res, sizeof(res));
+	ret = read_at_dptr(cmd, result);
+	if (ret) { return ret; }
 
 	return 0;
 }
+
+static int cc2530_read_xdata_memory_block(struct cc2530_cmd *cmd,
+				uint16_t addr, uint8_t *buffer, uint16_t num_bytes)
+{
+	int ret;
+	uint16_t i;
+
+	cmd = find_cmd_by_name("debug_inst");
+
+	ret = set_dptr(cmd, addr);
+	if (ret) { return ret; }
+
+	for (i = 0; i < num_bytes; i++) {
+        ret = read_at_dptr(cmd, &buffer[i]);
+        if (ret) { return ret; }
+
+		ret = inc_dptr(cmd);
+		if (ret) { return ret; }
+    }
+
+	return 0;
+}
+
+
+static int cc2530_write_xdata_memory(struct cc2530_cmd *cmd, uint16_t addr, uint8_t value)
+{
+	int ret;
+	uint16_t i;
+
+	cmd = find_cmd_by_name("debug_inst");
+
+	ret = set_dptr(cmd, addr);
+	if (ret) { return ret; }
+
+    ret = set_acc(cmd, value);
+    if (ret) { return ret; }
+
+    ret = copy_acc_to_dptr(cmd);
+    if (ret) { return ret; }
+
+	return 0;
+}
+
 
 static int cc2530_write_xdata_memory_block(struct cc2530_cmd *cmd,
 				uint16_t addr, const uint8_t *values, uint16_t num_bytes)
 {
 	int ret;
-	unsigned char instr[3];
-	unsigned char result;
 	uint16_t i;
 
 	cmd = find_cmd_by_name("debug_inst");
-	instr[0] = 0x90;
-	instr[1] = HIBYTE(addr);
-	instr[2] = LOBYTE(addr);
-	cmd->in = sizeof(instr);
 
-	ret = cc2530_do_cmd(cmd, instr, &result);
-	if (ret) {
-		fprintf(stderr, "failed to issue: %s\n", cmd->name);
-		return ret;
-	}
+	ret = set_dptr(cmd, addr);
+	if (ret) { return ret; }
 
 	for (i = 0; i < num_bytes; i++) {
-		instr[0] = 0x74;
-		instr[1] = values[i];
-		cmd->in = 2;
+		ret = set_acc(cmd, values[i]);
+		if (ret) { return ret; }
 
-		ret = cc2530_do_cmd(cmd, instr, &result);
-		if (ret) {
-			fprintf(stderr, "failed to issue: %s at %i\n", cmd->name, i);
-			return ret;
-		}
+		ret = copy_acc_to_dptr(cmd);
+		if (ret) { return ret; }
 
-		instr[0] = 0xF0;
-		cmd->in = 1;
-		ret = cc2530_do_cmd(cmd, instr, &result);
-		if (ret) {
-			fprintf(stderr, "failed to issue: %s at %i\n", cmd->name, i);
-			return ret;
-		}
-
-		instr[0] = 0xA3;
-		cmd->in = 1;
-		ret = cc2530_do_cmd(cmd, instr, &result);
-		if (ret) {
-			fprintf(stderr, "failed to issue: %s at %i\n", cmd->name, i);
-			return ret;
-		}
-	}
+		ret = inc_dptr(cmd);
+		if (ret) { return ret; }
+    }
 
 	return 0;
 }
+
+
+// Read block from flash. Assume caller provides a range in single bank
+static int read_flash_block(struct cc2530_cmd *cmd,
+				uint32_t addr, uint8_t *buffer, uint16_t num_bytes)
+{
+    uint8_t bank = addr / FLASH_BANK_SIZE;
+    uint16_t xaddr = (addr % FLASH_BANK_SIZE) | 0x8000;
+	int ret;
+
+	cmd = find_cmd_by_name("debug_inst");
+
+    //printf("read_flash_block @%06X: bank %d, addr %04X\n", addr, bank, xaddr);
+    ret = write_sfr(cmd, MEMCTR, bank);
+    if (ret) { return ret; }
+
+	return cc2530_read_xdata_memory_block(cmd, xaddr, buffer, num_bytes);
+}
+
 
 static uint32_t cc2530_flash_verify(struct cc2530_cmd *cmd, uint32_t max_addr)
 {
@@ -760,29 +843,17 @@ static uint32_t cc2530_flash_verify(struct cc2530_cmd *cmd, uint32_t max_addr)
 			return ret;
 		}
 
-		cmd = find_cmd_by_name("debug_inst");
-		instr[0] = 0x90;
-		instr[1] = 0x80;
-		instr[2] = 0x00;
-		cmd->in = sizeof(instr);
+        cmd = find_cmd_by_name("debug_inst");
 
-		ret = cc2530_do_cmd(cmd, instr, &result);
-		if (ret) {
-			fprintf(stderr, "%s: command failed: %s\n", __func__, cmd->name);
-			return ret;
-		}
+        ret = set_dptr(cmd, 0x8000);
+        if (ret) { return ret; }
 
 		for (i = 0; i < 32*1024; i++) {
 			if (addr == max_addr)
 				return addr;
 
-			instr[0] = 0xE0;
-			cmd->in = 1;
-			ret = cc2530_do_cmd(cmd, instr, &result);
-			if (ret) {
-				fprintf(stderr, "%s: command failed at %i\n", __func__, i);
-				return ret;
-			}
+            read_at_dptr(cmd, &result);
+			if (ret) { return ret; }
 
 			expected = get_next_flash_byte();
 			if (result != expected) {
@@ -790,13 +861,9 @@ static uint32_t cc2530_flash_verify(struct cc2530_cmd *cmd, uint32_t max_addr)
 						bank, i, result, expected);
 			}
 
-			instr[0] = 0xA3;
-			cmd->in = 1;
-			ret = cc2530_do_cmd(cmd, instr, &result);
-			if (ret) {
-				fprintf(stderr, "%s: command failed at %i\n", __func__, i);
-				return ret;
-			}
+            inc_dptr(cmd);
+			if (ret) { return ret; }
+
 			addr++;
 		}
 	}
@@ -811,6 +878,7 @@ static uint8_t cc2530_program_flash(struct cc2530_cmd *cmd, uint16_t num_buffers
 	uint16_t i;
 	uint8_t wait;
 	unsigned char result;
+	unsigned char bank;
 	int ret;
 	unsigned int timeout = DEFAULT_TIMEOUT;
 
@@ -919,12 +987,20 @@ static uint8_t cc2530_program_flash(struct cc2530_cmd *cmd, uint16_t num_buffers
 	return max_speed;
 }
 
+void println_hex(uint8_t * values, int size) {
+	int i;
+    for (i = 0; i < size - 1; i++) printf("%02x:", values[i]);
+    printf("%02x\n", values[i]);
+}
+
 static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 {
 	int ret = 0;
 	unsigned char result[2] = { 0 };
-	unsigned char ext_addr[8] = { 0 };
+	unsigned char mac_addr[8] = { 0 };
+	unsigned char extra_data[24] = { 0 };
 	int i;
+    unsigned int mac_location; int mac_size = 8;
 
 	ret = gpio_set_direction(DATA_GPIO, GPIO_DIRECTION_OUT);
 	if (ret) {
@@ -948,6 +1024,13 @@ static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 		ret = -EINVAL;
 		goto out;
 	}
+    if (result[0] == CC2530_ID) {
+        mac_location = 0x780C;
+        mac_size = 8;
+    } else {
+        mac_location = 0x780E;
+        mac_size = 6;
+    }
 
 	if (verbose)
         printf("Texas Instruments CC2530 (ID: 0x%02x, rev 0x%02x)\n", result[0], result[1]);
@@ -956,30 +1039,13 @@ static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 	cmd = find_cmd_by_name("halt");
 	ret = cc2530_do_cmd(cmd, NULL, result);
 	if (ret) { fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name); goto out; }
-    printf("status halt returns: %02x\n", result[0]);
-
-	cmd = find_cmd_by_name("read_status");
-	ret = cc2530_do_cmd(cmd, NULL, result);
-	if (ret) { fprintf(stderr, "%s: failed to issue: %s\n", __func__, cmd->name); goto out; }
-    printf("status after halt: %02x\n", result[0]);
+	if (verbose) {
+        printf("status halt returns: %02x\n", result[0]);
+    }
 
 	/*
 	 * Do some chip identification
 	 */
-	for (i = 0; i < 7; i++) {
-		ret = cc2530_read_xdata_memory(cmd, X_EXT_ADDR_BASE + i, result);
-		if (ret) {
-			fprintf(stderr, "%s: failed to read X_ETXADDR%d\n", __func__, i);
-			return ret;
-		}
-		ext_addr[i] = result[0];
-	}
-
-	if (verbose)
-		printf("Extended addr: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
-			ext_addr[7], ext_addr[6], ext_addr[5], ext_addr[4],
-			ext_addr[3], ext_addr[2], ext_addr[1], ext_addr[0]);
-
 	ret = cc2530_read_xdata_memory(cmd, X_CHIPINFO0, result);
 	if (ret) {
 		fprintf(stderr, "failed to read X_CHIPINFO0 register\n");
@@ -1018,6 +1084,38 @@ static int cc2530_chip_identify(struct cc2530_cmd *cmd, int *flash_size)
 		fprintf(stderr, "failed to read X_CHIPINFO1 register\n");
 		return ret;
 	}
+
+	for (i = 0; i < mac_size; i++) {
+		ret = cc2530_read_xdata_memory(cmd, mac_location + i, result);
+		if (ret) {
+			fprintf(stderr, "%s: failed to read Mac addr %d\n", __func__, i);
+			return ret;
+		}
+		mac_addr[i] = result[0];
+	}
+
+	if (verbose) {
+		printf("Mac addr: ");
+        println_hex(mac_addr, mac_size);
+    }
+
+    ret = read_flash_block(cmd, *flash_size - 16 - mac_size, extra_data, 16 + mac_size);
+    if (ret) { return ret; }
+
+	if (verbose) {
+		printf("Mac2 addr (@%06X): ", *flash_size - 16 - mac_size);
+        println_hex(extra_data, mac_size);
+
+		printf("Lock data (@%06X): ", *flash_size - 16);
+        println_hex(extra_data + mac_size, 16);
+    }
+    
+    ret = cc2530_write_xdata_memory(cmd, X_MEMCTR, 0);
+    if (ret) {
+        fprintf(stderr, "%s: failed to write to X_MEMCTR\n", __func__);
+        return ret;
+    }
+
 out:
 	return ret;
 }
